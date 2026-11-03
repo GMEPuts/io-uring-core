@@ -69,7 +69,7 @@ impl Default for IoBuilder {
     fn default() -> Self {
         IoBuilder {
             wait: WaitMode::Spin,
-            napi_busy_poll_us: 1_000_000,
+            napi_busy_poll_us: 5_000,
             ring_entries: 256,
             recv_buffers: 256,
             recv_buffer_len: 16 * 1024,
@@ -87,8 +87,13 @@ impl IoBuilder {
         self
     }
 
-    /// NAPI busy-poll budget per wait, in µs (default 1 s). Each wait is capped at a quarter of
+    /// NAPI busy-poll budget per wait, in µs (default 5 ms). Each wait is capped at a quarter of
     /// it, so a wait always ends while still busy polling and the thread never actually sleeps.
+    ///
+    /// Keep it under 10 ms: the kernel (seen on 6.18) ends an io_uring busy poll after 10 ms
+    /// whatever budget is asked for, then sleeps until a completion arrives. With a 1 s budget
+    /// (waits capped at 250 ms) a quiet feed left the thread asleep ~65% of the time, with
+    /// packets handled by the NIC interrupt on another core.
     pub fn napi_busy_poll_us(mut self, us: u32) -> Self {
         self.napi_busy_poll_us = us;
         self
