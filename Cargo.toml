@@ -1,0 +1,32 @@
+[package]
+name = "io_uring_core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Connection-oriented io_uring WebSocket client runtime: register connections, the IO owns their lifecycle."
+publish = false
+
+[dependencies]
+# No crypto provider by default at this level: the `ring` / `aws-lc-rs` features pick one,
+# or the caller supplies its own ClientConfig via IoBuilder::tls_config.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+webpki-roots = "1"
+base64 = "0.22"
+fastrand = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+libc = "0.2"
+rtrb = "0.3"
+
+[features]
+default = ["ring"]
+ring = ["rustls/ring"]
+aws-lc-rs = ["rustls/aws_lc_rs"]
+
+# Only applies when building this crate's own tests/examples. Consumers must set these
+# in their own Cargo.toml: Cargo ignores dependency profiles.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
