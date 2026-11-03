@@ -87,8 +87,8 @@ impl IoBuilder {
         self
     }
 
-    /// NAPI busy-poll budget per wait, in µs (default 1 s: the poll ends at the first
-    /// completion or deadline, so in practice the thread never sleeps).
+    /// NAPI busy-poll budget per wait, in µs (default 1 s). Each wait is capped at a quarter of
+    /// it, so a wait always ends while still busy polling and the thread never actually sleeps.
     pub fn napi_busy_poll_us(mut self, us: u32) -> Self {
         self.napi_busy_poll_us = us;
         self
@@ -149,7 +149,9 @@ impl IoBuilder {
         let tls = self.tls_config.or_else(default_tls);
         let mut core = Core::new(ring, bufs.bgid(), waker, tls, self.max_connections, self.rx_buffer);
         core.arm_wake();
-        Ok(Io { core, bufs, app, channels: Vec::new(), wait: self.wait })
+        let max_wait = (self.wait == WaitMode::Napi)
+            .then(|| Duration::from_micros(self.napi_busy_poll_us as u64 / 4).max(Duration::from_micros(10)));
+        Ok(Io { core, bufs, app, channels: Vec::new(), wait: self.wait, max_wait })
     }
 }
 
@@ -179,6 +181,9 @@ pub struct Io<A> {
     app: A,
     channels: Vec<Box<dyn Inbox<A>>>,
     wait: WaitMode,
+    /// Longest single wait. In NAPI mode it is well inside the busy-poll budget, so every wait
+    /// ends (by completion or timeout) while still polling and the thread never actually sleeps.
+    max_wait: Option<Duration>,
 }
 
 impl<A: 'static> Io<A> {
@@ -285,10 +290,14 @@ impl<A: 'static> Io<A> {
         core.waker.sleeping.store(true, Ordering::Relaxed);
         fence(Ordering::SeqCst);
         let pending = self.channels.iter().any(|c| c.has_items()) || core.resolver.as_ref().is_some_and(|r| r.has_results());
+        let timeout = match (deadline.map(|d| d - now), self.max_wait) {
+            (Some(t), Some(cap)) => Some(t.min(cap)),
+            (t, cap) => t.or(cap),
+        };
         let res = if pending {
             core.ring.submit()
-        } else if let Some(d) = deadline {
-            let ts = types::Timespec::from(d - now);
+        } else if let Some(t) = timeout {
+            let ts = types::Timespec::from(t);
             let args = types::SubmitArgs::new().timespec(&ts);
             core.ring.submitter().submit_with_args(1, &args)
         } else {

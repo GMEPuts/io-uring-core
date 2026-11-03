@@ -30,8 +30,8 @@ const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
 const DNS_REFRESH: Duration = Duration::from_secs(30);
 /// A closed connection whose last send is still owned by the kernel retries this soon.
 const SEND_DRAIN_RETRY: Duration = Duration::from_millis(10);
-/// Longest rotation stagger between connections of one registration.
-const MAX_ROTATE_STAGGER: Duration = Duration::from_secs(600);
+/// Spacing between rotations of consecutive connection slots.
+const ROTATE_STAGGER: Duration = Duration::from_secs(600);
 
 pub(crate) type MsgHandler<A> = Box<dyn FnMut(&mut A, &mut Cx<'_, A>, Msg<'_>)>;
 pub(crate) type ConnHook<A> = Box<dyn FnMut(&mut A, &mut Cx<'_, A>, ConnId)>;
@@ -100,6 +100,17 @@ pub(crate) struct Core<A> {
     pub resolver: Option<Resolver>,
     /// Cached once per loop pass.
     pub now: Instant,
+}
+
+/// How much earlier than `max_age` connection `slot` rotates. Slots are unique across all
+/// registrations, so every connection rotates at its own time (600 s apart), wrapping within
+/// half the age so short ages still work.
+fn rotate_offset(slot: usize, max_age: Duration) -> Duration {
+    let half = max_age.as_secs() / 2;
+    if half == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_secs((slot as u64 * ROTATE_STAGGER.as_secs()) % half)
 }
 
 #[inline]
@@ -212,12 +223,9 @@ impl<A: 'static> Core<A> {
         });
         self.handlers.push(Some(handler));
 
-        // Connections of one registration rotate at staggered times, so they never all
-        // reconnect together.
-        let stagger = spec.max_age.map(|a| (a / (2 * n as u32)).min(MAX_ROTATE_STAGGER)).unwrap_or_default();
         for k in 0..n {
-            let age = spec.max_age.map(|a| a.saturating_sub(stagger * k as u32));
-            let s = self.alloc_slot(gi as u32, k, age, now);
+            let s = self.alloc_slot(gi as u32, k, spec.max_age, now);
+            self.conns[s].max_age = spec.max_age.map(|a| a.saturating_sub(rotate_offset(s, a)));
             self.groups[gi].conns.push(s as u16);
             self.schedule_conn(s); // Idle, retry now: connects on the next timer pass.
         }

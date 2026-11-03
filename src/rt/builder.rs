@@ -85,8 +85,9 @@ impl<'a, A: 'static> WsBuilder<'a, A> {
         self
     }
 
-    /// Rotates each connection after this long (staggered across the registration's
-    /// connections). E.g. Binance drops connections at 24 h.
+    /// Rotates each connection after at most this long. Connections are staggered 10 min apart
+    /// (across all registrations), so they never rotate together. E.g. Binance drops
+    /// connections at 24 h.
     pub fn max_age(mut self, d: Duration) -> Self {
         self.max_age = Some(d);
         self

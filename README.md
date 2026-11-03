@@ -52,7 +52,7 @@ All of these are optional and chained on `io.ws(url)`:
 | `.stale_after(d)` / `.never_stale()` | How long a silent connection lives before reconnecting. |
 | `.header(k, v)` | Extra upgrade header. Setting `User-Agent` replaces the default browser-like one. |
 | `.connections(n)` | Opens `n` identical connections, spread over the resolved IPs. They share one handler. |
-| `.max_age(d)` | Rotates connections periodically, staggered across the `n`. Binance drops connections at 24 h. |
+| `.max_age(d)` | Rotates connections periodically. Connections are staggered 10 minutes apart, across all registrations, so they never rotate together. Binance drops connections at 24 h. |
 | `.on_message(f)` | The handler. |
 
 ## Pings
