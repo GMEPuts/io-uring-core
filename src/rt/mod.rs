@@ -16,4 +16,5 @@ pub use builder::WsBuilder;
 pub use channel::{Full, Sender};
 pub use cx::{ConnInfo, Cx};
 pub use io::{Io, IoBuilder, WaitMode};
+pub use resolver::{DnsAnswer, DnsPort, DnsRequest};
 pub use spawn::spawn;

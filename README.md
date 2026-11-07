@@ -32,7 +32,7 @@ io.run()
 
 | Concern | Behaviour |
 |---|---|
-| DNS | Resolved by `.open()`. When connections keep failing, it is re-resolved on a helper thread, never on the IO thread. |
+| DNS | Resolved by `.open()`. When connections keep failing, it is re-resolved on a helper thread, never on the IO thread. `IoBuilder::external_dns` hands those lookups to a thread you own instead, through a `DnsPort`, so the crate starts no thread. |
 | Connect, TLS, upgrade | Run in order, with timeouts of 5 s, 5 s and 10 s. |
 | `.subscribe(msg)` | Sent after every successful connect and reconnect. |
 | Server pings | WebSocket ping frames are answered automatically. |
@@ -89,7 +89,8 @@ cx.send_text(handle, &json)?;    // any open connection of a registration (the h
 cx.send_binary(conn, &bytes)?;
 cx.reconnect(conn);              // drop the session, reconnect now (to another IP)
 cx.remove(handle);               // close a registration for good
-cx.ws(url)…open()?;              // register a new connection at runtime (DNS on a helper thread)
+cx.ws(url)…open()?;              // register a new connection at runtime (DNS off the IO thread)
+cx.flush();                      // send what's queued now, to time the send()
 ```
 
 Sends made inside a handler go out as soon as that handler returns. Each connection touched costs one non-blocking `send()`, written straight to the socket. If the socket buffer is full, the rest is handed to io_uring. Two sends are never in flight on one socket at once.

@@ -415,24 +415,30 @@ impl<A: 'static> Core<A> {
             match Resolver::spawn(self.waker.clone()) {
                 Ok(r) => self.resolver = Some(r),
                 Err(_) => {
-                    // No resolver thread: let waiting connections retry later.
-                    let now = Instant::now();
-                    for k in 0..self.groups[gi].conns.len() {
-                        let s = self.groups[gi].conns[k] as usize;
-                        if self.conns[s].state == State::Resolving {
-                            self.conns[s].state = State::Idle { retry_at: now + Duration::from_secs(1) };
-                            self.schedule_conn(s);
-                        }
-                    }
+                    self.retry_resolving_later(gi);
                     return;
                 }
             }
         }
         let g = &mut self.groups[gi];
-        g.resolving = true;
-        g.last_resolve = Some(Instant::now());
-        if let Some(r) = &self.resolver {
-            r.request(gi as u32, &g.url.host, g.url.port);
+        let accepted = self.resolver.as_mut().is_some_and(|r| r.request(gi as u32, &g.url.host, g.url.port));
+        if accepted {
+            g.resolving = true;
+            g.last_resolve = Some(Instant::now());
+        } else {
+            self.retry_resolving_later(gi);
+        }
+    }
+
+    /// The lookup can't start. Nothing else wakes a connection waiting on it, so it tries again later.
+    fn retry_resolving_later(&mut self, gi: usize) {
+        let now = Instant::now();
+        for k in 0..self.groups[gi].conns.len() {
+            let s = self.groups[gi].conns[k] as usize;
+            if self.conns[s].state == State::Resolving {
+                self.conns[s].state = State::Idle { retry_at: now + Duration::from_secs(1) };
+                self.schedule_conn(s);
+            }
         }
     }
 
@@ -453,7 +459,7 @@ impl<A: 'static> Core<A> {
             }
             let g = &mut self.groups[gi];
             g.resolving = false;
-            if let Ok(mut addrs) = res.result {
+            if let Ok(mut addrs) = res.addresses {
                 if !addrs.is_empty() {
                     fastrand::shuffle(&mut addrs);
                     g.addrs = addrs;

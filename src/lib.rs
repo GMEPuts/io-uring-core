@@ -55,7 +55,7 @@ pub use types::{ConnId, Handle, Msg, Target};
 pub use ws::WsError;
 
 #[cfg(target_os = "linux")]
-pub use rt::{spawn, ConnInfo, Cx, Full, Io, IoBuilder, Sender, WaitMode, WsBuilder};
+pub use rt::{spawn, ConnInfo, Cx, DnsAnswer, DnsPort, DnsRequest, Full, Io, IoBuilder, Sender, WaitMode, WsBuilder};
 
 /// `Duration` of `n` milliseconds.
 pub const fn millis(n: u64) -> Duration {

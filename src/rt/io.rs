@@ -9,7 +9,7 @@ use io_uring::{cqueue, types, IoUring};
 use rustls::ClientConfig;
 
 use crate::backoff::{backoff, jitter};
-use crate::clock::now_us;
+use crate::clock::{now_ticks, now_us};
 use crate::error::CloseReason;
 use crate::timer::TimerKey;
 use crate::types::{ConnId, Handle, Msg};
@@ -21,6 +21,7 @@ use super::channel::{self, Inbox, Sender, Waker};
 use super::conn::{RxSide, State};
 use super::cx::Cx;
 use super::engine::Core;
+use super::resolver::{DnsPort, Resolver};
 use super::socket;
 use super::token::{Op, Token};
 
@@ -63,6 +64,7 @@ pub struct IoBuilder {
     rx_buffer: usize,
     max_connections: usize,
     tls_config: Option<Arc<ClientConfig>>,
+    external_dns: bool,
 }
 
 impl Default for IoBuilder {
@@ -76,6 +78,7 @@ impl Default for IoBuilder {
             rx_buffer: 128 * 1024,
             max_connections: 128,
             tls_config: None,
+            external_dns: false,
         }
     }
 }
@@ -134,6 +137,15 @@ impl IoBuilder {
         self
     }
 
+    /// Re-resolves DNS through a [`DnsPort`] rather than the crate's helper thread, for a program that
+    /// must control every thread it runs. Collect the port with [`Io::take_dns_port`], and keep
+    /// answering it: a connection whose lookup is never answered waits for it. `.open()` still
+    /// resolves on the calling thread during setup.
+    pub fn external_dns(mut self) -> Self {
+        self.external_dns = true;
+        self
+    }
+
     /// Creates the runtime. Call it on the thread that will `run` it (io_uring's single-issuer
     /// mode ties the ring to its creating thread); `io_uring_core::spawn` does that for you.
     pub fn build<A: 'static>(self, app: A) -> io::Result<Io<A>> {
@@ -154,9 +166,14 @@ impl IoBuilder {
         let tls = self.tls_config.or_else(default_tls);
         let mut core = Core::new(ring, bufs.bgid(), waker, tls, self.max_connections, self.rx_buffer);
         core.arm_wake();
+        let dns_port = self.external_dns.then(|| {
+            let (resolver, port) = Resolver::external(core.waker.clone());
+            core.resolver = Some(resolver);
+            port
+        });
         let max_wait = (self.wait == WaitMode::Napi)
             .then(|| Duration::from_micros(self.napi_busy_poll_us as u64 / 4).max(Duration::from_micros(10)));
-        Ok(Io { core, bufs, app, channels: Vec::new(), wait: self.wait, max_wait })
+        Ok(Io { core, bufs, app, channels: Vec::new(), wait: self.wait, max_wait, dns_port })
     }
 }
 
@@ -189,6 +206,7 @@ pub struct Io<A> {
     /// Longest single wait. In NAPI mode it is well inside the busy-poll budget, so every wait
     /// ends (by completion or timeout) while still polling and the thread never actually sleeps.
     max_wait: Option<Duration>,
+    dns_port: Option<DnsPort>,
 }
 
 impl<A: 'static> Io<A> {
@@ -239,6 +257,11 @@ impl<A: 'static> Io<A> {
         tx
     }
 
+    /// The port from [`IoBuilder::external_dns`], once. `None` without that setting.
+    pub fn take_dns_port(&mut self) -> Option<DnsPort> {
+        self.dns_port.take()
+    }
+
     /// Your app state.
     pub fn app(&self) -> &A {
         &self.app
@@ -263,13 +286,21 @@ impl<A: 'static> Io<A> {
         while let Some((user_data, res, flags)) = self.next_cqe() {
             self.on_cqe(user_data, res, flags);
             settle(&mut self.app, &mut self.core);
+            // A busy feed mustn't hold up channel work, such as an order, until the batch of
+            // completions ends. Costs one atomic load per channel.
+            self.drain_channels();
         }
-        for ch in self.channels.iter_mut() {
-            ch.drain(&mut self.app, &mut self.core);
-        }
+        self.drain_channels();
         self.core.poll_resolver();
         self.run_timers();
         Ok(())
+    }
+
+    #[inline]
+    fn drain_channels(&mut self) {
+        for ch in self.channels.iter_mut() {
+            ch.drain(&mut self.app, &mut self.core);
+        }
     }
 
     #[inline]
@@ -455,9 +486,16 @@ fn apply_close<A: 'static>(app: &mut A, core: &mut Core<A>, slot: usize, reason:
     }
 }
 
+/// When a receive completion was handled, on both clocks. Taken together, so they mark one moment.
+#[derive(Clone, Copy)]
+struct RecvTime {
+    us: u64,
+    ticks: u64,
+}
+
 #[inline]
 fn on_recv<A: 'static>(app: &mut A, core: &mut Core<A>, bufs: &mut BufRing, slot: usize, res: i32, flags: u32) {
-    let recv_ts = now_us();
+    let recv = RecvTime { us: now_us(), ticks: now_ticks() };
     if !cqueue::more(flags) {
         core.conns[slot].recv_armed = false;
     }
@@ -472,10 +510,10 @@ fn on_recv<A: 'static>(app: &mut A, core: &mut Core<A>, bufs: &mut BufRing, slot
         }
         let bytes = bufs.get(bid, res as usize);
         let mut rx = mem::take(&mut core.conns[slot].rx);
-        let result = process_bytes(app, core, slot, &mut rx, bytes, recv_ts);
+        let result = process_bytes(app, core, slot, &mut rx, bytes, recv);
         core.conns[slot].rx = rx;
         bufs.recycle(bid);
-        core.conns[slot].last_rx_us = recv_ts;
+        core.conns[slot].last_rx_us = recv.us;
         if let Err(reason) = result {
             core.request_close(slot, reason);
             return;
@@ -507,13 +545,13 @@ fn process_bytes<A: 'static>(
     slot: usize,
     rx: &mut RxSide,
     mut bytes: &[u8],
-    recv_ts: u64,
+    recv: RecvTime,
 ) -> Result<(), CloseReason> {
     if core.conns[slot].tls.is_some() {
         while !bytes.is_empty() {
             let tls = core.conns[slot].tls.as_mut().ok_or(CloseReason::Tls)?;
             tls.read_chunk(&mut bytes, &mut rx.buf)?;
-            advance(app, core, slot, rx, recv_ts)?;
+            advance(app, core, slot, rx, recv)?;
             if core.conns[slot].closing.is_some() {
                 return Ok(());
             }
@@ -528,7 +566,7 @@ fn process_bytes<A: 'static>(
             spare[..n].copy_from_slice(&bytes[..n]);
             rx.buf.commit(n);
             bytes = &bytes[n..];
-            advance(app, core, slot, rx, recv_ts)?;
+            advance(app, core, slot, rx, recv)?;
             if core.conns[slot].closing.is_some() {
                 return Ok(());
             }
@@ -540,7 +578,7 @@ fn process_bytes<A: 'static>(
 /// Moves the connection forward with whatever plaintext is buffered: TLS done → send upgrade,
 /// upgrade response → open, then WebSocket frames → handlers.
 #[inline]
-fn advance<A: 'static>(app: &mut A, core: &mut Core<A>, slot: usize, rx: &mut RxSide, recv_ts: u64) -> Result<(), CloseReason> {
+fn advance<A: 'static>(app: &mut A, core: &mut Core<A>, slot: usize, rx: &mut RxSide, recv: RecvTime) -> Result<(), CloseReason> {
     if let State::Tls { .. } = core.conns[slot].state {
         if core.conns[slot].tls.as_ref().is_some_and(|t| t.is_handshaking()) {
             return Ok(());
@@ -585,7 +623,7 @@ fn advance<A: 'static>(app: &mut A, core: &mut Core<A>, slot: usize, rx: &mut Rx
                 }
                 let binary = frame.opcode == OpCode::Binary;
                 if frame.fin {
-                    dispatch(app, core, slot, frame.payload, binary, recv_ts);
+                    dispatch(app, core, slot, frame.payload, binary, recv);
                 } else {
                     frag.clear();
                     frag.extend_from_slice(frame.payload);
@@ -603,7 +641,7 @@ fn advance<A: 'static>(app: &mut A, core: &mut Core<A>, slot: usize, rx: &mut Rx
                 frag.extend_from_slice(frame.payload);
                 if frame.fin {
                     *frag_active = false;
-                    dispatch(app, core, slot, frag, *frag_binary, recv_ts);
+                    dispatch(app, core, slot, frag, *frag_binary, recv);
                     frag.clear();
                 }
             }
@@ -624,7 +662,7 @@ fn advance<A: 'static>(app: &mut A, core: &mut Core<A>, slot: usize, rx: &mut Rx
 
 /// Hands one message to its registration's handler, then sends whatever the handler queued.
 #[inline]
-fn dispatch<A: 'static>(app: &mut A, core: &mut Core<A>, slot: usize, data: &[u8], binary: bool, recv_ts: u64) {
+fn dispatch<A: 'static>(app: &mut A, core: &mut Core<A>, slot: usize, data: &[u8], binary: bool, recv: RecvTime) {
     let (gi, epoch) = {
         let c = &core.conns[slot];
         (c.group as usize, c.epoch)
@@ -635,7 +673,7 @@ fn dispatch<A: 'static>(app: &mut A, core: &mut Core<A>, slot: usize, data: &[u8
         return;
     }
     let Some(mut handler) = core.handlers[gi].take() else { return };
-    let msg = Msg { data, conn: ConnId { slot: slot as u16, epoch }, handle: Handle { group: gi as u32 }, recv_ts, binary };
+    let msg = Msg { data, conn: ConnId { slot: slot as u16, epoch }, handle: Handle { group: gi as u32 }, recv_ts: recv.us, recv_ticks: recv.ticks, binary };
     handler(app, &mut Cx::new(core), msg);
     if !core.groups[gi].removed {
         core.handlers[gi] = Some(handler);
@@ -650,4 +688,22 @@ fn fire_open<A: 'static>(app: &mut A, core: &mut Core<A>, slot: usize) {
         core.on_open.get_or_insert(h);
     }
     core.flush_dirty();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Needs a kernel with io_uring, so this first runs on the host.
+    #[test]
+    fn external_dns_hands_out_its_port_once() {
+        let mut with_port = Io::builder().wait(WaitMode::Block).external_dns().build(()).unwrap();
+        assert!(matches!(with_port.core.resolver, Some(Resolver::External { .. })));
+        assert!(with_port.take_dns_port().is_some());
+        assert!(with_port.take_dns_port().is_none());
+
+        let mut without = Io::builder().wait(WaitMode::Block).build(()).unwrap();
+        assert!(without.core.resolver.is_none(), "the helper thread still starts lazily");
+        assert!(without.take_dns_port().is_none());
+    }
 }

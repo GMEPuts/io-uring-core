@@ -65,6 +65,8 @@ pub struct Msg<'a> {
     pub handle: Handle,
     /// Unix µs when the receive completion was handled.
     pub recv_ts: u64,
+    /// The tick counter at the same moment, from [`crate::clock::now_ticks`].
+    pub recv_ticks: u64,
     /// Binary frame (otherwise text).
     pub binary: bool,
 }

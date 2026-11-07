@@ -51,6 +51,13 @@ impl<'a, A: 'static> Cx<'a, A> {
         self.core.send_ws(to.into(), OpCode::Binary, data.as_ref())
     }
 
+    /// Sends what's queued now rather than when the handler returns, so a handler can time the
+    /// `send()`. A failure closes the connection afterwards, as it would at the end of the handler.
+    #[inline]
+    pub fn flush(&mut self) {
+        self.core.flush_dirty();
+    }
+
     /// Drops the current session and reconnects right away, to a different IP when the host
     /// has several (e.g. to replace a connection that keeps losing the race).
     pub fn reconnect(&mut self, conn: ConnId) {
@@ -64,8 +71,8 @@ impl<'a, A: 'static> Cx<'a, A> {
         self.core.remove_group(handle.group as usize);
     }
 
-    /// Registers a WebSocket endpoint at runtime. DNS is resolved on a helper thread; the
-    /// connections start once it returns.
+    /// Registers a WebSocket endpoint at runtime. DNS is resolved off the IO thread, on the helper
+    /// thread or through a `DnsPort`, and the connections start once it returns.
     pub fn ws(&mut self, url: &str) -> WsBuilder<'_, A> {
         WsBuilder::new(self.core, url, false)
     }
